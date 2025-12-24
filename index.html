@@ -238,20 +238,23 @@
 
         // 移动端性能优化：动态调整粒子数量
         const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        // 新增：区分苹果设备（Safari）
+        const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) && !window.MSStream;
         const CONFIG = {
             colors: {
                 bg: 0x020205, 
                 gold: 0xffd700, 
-                red: 0x880000, 
+                red: 0x880000,
                 green: 0x004400,
                 white: 0xffffff
             },
             particles: { 
-                count: isMobile ? 1000 : 1800, 
-                dustCount: isMobile ? 800 : 1500, 
+                // 优化：苹果设备粒子数量和安卓保持一致（原苹果/安卓差异导致视觉松散）
+                count: isMobile ? 1200 : 1800, 
+                dustCount: isMobile ? 1000 : 1500, 
                 treeHeight: 28, 
                 treeRadius: 9,
-                snowCount: isMobile ? 1500 : 2500, 
+                snowCount: isMobile ? 1800 : 2500, 
                 snowSpeed: 10 
             },
             camera: { z: 55 },
@@ -264,6 +267,12 @@
                 ringYOffset: 0, 
                 ringZOffset: 0,
                 currentPhotoScale: 1.8 // 新增：当前展示照片额外放大倍数
+            },
+            // 新增：Safari适配参数（仅保留渲染/创建相关，移除扩展/音频）
+            safari: {
+                particleCreateDelay: 5, // 苹果端粒子创建延迟（毫秒），确保创建进度
+                renderPixelRatio: isIOS ? 1.0 : Math.min(window.devicePixelRatio, isMobile ? 1.0 : 1.5),
+                bloomStrength: isIOS ? 0.4 : (isMobile ? 0.3 : 0.5)
             }
         };
 
@@ -272,7 +281,7 @@
             focusTarget: null, 
             currentPhotoIndex: -1,
             hand: { detected: false, x: 0, y: 0 },
-            rotation: { x: 0, y: 0 }, 
+            rotation: { x: 0.1, y: 0 }, // 优化：初始旋转角度固定，避免苹果/安卓初始帧差异
             spinVel: { x: 0, y: 0 }, 
             time: 0,
             wasPointing: false, 
@@ -296,7 +305,11 @@
             photoRingRotation: 0,       
             photoRingTimer: null,
             isImported: false, // 新增：标记是否已导入成功
-            currentDisplayPhotoIndex: -1 // 新增：标记环形中当前展示的照片索引
+            currentDisplayPhotoIndex: -1, // 新增：标记环形中当前展示的照片索引
+            // 新增：粒子创建完成标记
+            particlesCreated: false,
+            dustCreated: false,
+            starCreated: false
         };
 
         let scene, camera, renderer, composer, clock = new THREE.Clock();
@@ -333,7 +346,12 @@
             // 4. 异步执行非核心初始化（不阻塞首屏）
             Promise.all([
                 initTexturesAndMaterials(), // 纹理/材质异步创建
-                initParticleSystem(),       // 粒子系统异步创建
+                // 优化：苹果端优先创建星星，再创建粒子（解决星星加载慢问题）
+                (async () => {
+                    await createStarTopper(); // 优先创建顶部星星
+                    STATE.starCreated = true;
+                    await initParticleSystem(); // 再创建粒子
+                })(),       
                 setupBasicEvents(),         // 基础事件绑定
                 setupLetterDisplay(),       // 书信层初始化
                 setupMobileTouchControls()  // 触摸控制初始化
@@ -429,21 +447,28 @@
             camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 2000);
             camera.position.set(0, 0, CONFIG.camera.z); 
 
-            // 优化点：提前设置渲染器参数，减少重绘
+            // 优化点：针对Safari调整渲染器参数，减少重绘（仅保留核心渲染参数，移除WebGL扩展）
             renderer = new THREE.WebGLRenderer({ 
                 antialias: isMobile ? false : true,
                 powerPreference: "high-performance", 
                 depth: true,
-                preserveDrawingBuffer: false // 减少内存占用
+                preserveDrawingBuffer: false, // 减少内存占用
+                // 仅保留精度配置，移除扩展相关
+                precision: isIOS ? "lowp" : "highp",
+                alpha: false
             });
             renderer.setSize(window.innerWidth, window.innerHeight);
-            renderer.setPixelRatio(Math.min(window.devicePixelRatio, isMobile ? 1.0 : 1.5));
+            // 优化：统一苹果/安卓像素比
+            renderer.setPixelRatio(CONFIG.safari.renderPixelRatio);
             renderer.toneMapping = THREE.ACESFilmicToneMapping; 
-            renderer.toneMappingExposure = 1.0; 
+            renderer.toneMappingExposure = isIOS ? 1.1 : 1.0; // 苹果端提升曝光，匹配安卓亮度
+            
             document.getElementById('canvas-container').appendChild(renderer.domElement);
 
             bgGroup = new THREE.Group(); scene.add(bgGroup);
-            mainGroup = new THREE.Group(); mainGroup.rotation.x = 0.1; scene.add(mainGroup);
+            mainGroup = new THREE.Group(); 
+            mainGroup.rotation.x = STATE.rotation.x; // 使用固定初始旋转角度
+            scene.add(mainGroup);
             starGroup = new THREE.Group(); mainGroup.add(starGroup);
             photoMeshGroup = new THREE.Group(); mainGroup.add(photoMeshGroup);
         }
@@ -470,7 +495,8 @@
         }
 
         function setupPostProcessing() {
-            const bloomStrength = isMobile ? 0.3 : 0.5;
+            // 优化：统一苹果/安卓泛光强度
+            const bloomStrength = CONFIG.safari.bloomStrength;
             const bloom = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
             bloom.threshold = 0.75; 
             bloom.strength = bloomStrength; 
@@ -612,7 +638,7 @@
         }
 
         function createGalaxyBackground() {
-            const geometry = new THREE.BufferGeometry(), count = isMobile ? 1500 : 3000;
+            const geometry = new THREE.BufferGeometry(), count = isMobile ? 1800 : 3000; // 苹果端增加星系粒子，匹配安卓视觉密度
             const pos = new Float32Array(count * 3), sizes = new Float32Array(count), colors = new Float32Array(count * 3);
             const c1 = new THREE.Color(0x88aaff), c2 = new THREE.Color(0xffffee), c3 = new THREE.Color(0xffd700);
             for(let i=0; i<count; i++) {
@@ -635,9 +661,9 @@
             const curve = new THREE.CatmullRomCurve3([new THREE.Vector3(0,-0.5,0), new THREE.Vector3(0,0.3,0), new THREE.Vector3(0.1,0.5,0), new THREE.Vector3(0.3,0.4,0)]);
             const candyGeo = new THREE.TubeGeometry(curve, 8, 0.08, 6, false), dustGeo = new THREE.OctahedronGeometry(0.1, 0);
 
-            // 优化点：分批创建粒子，减少单次主线程阻塞
+            // 优化点：替换requestIdleCallback为setTimeout（Safari对requestIdleCallback调度保守）
             let created = 0;
-            const batchSize = isMobile ? 200 : 400;
+            const batchSize = isMobile ? 300 : 400; // 增大批次，加快苹果端创建速度
             
             function createBatch() {
                 const end = Math.min(created + batchSize, CONFIG.particles.count);
@@ -655,7 +681,8 @@
                 created = end;
                 
                 if (created < CONFIG.particles.count) {
-                    requestIdleCallback(createBatch); // 利用空闲时间创建剩余粒子
+                    // 优化：苹果端用setTimeout替代requestIdleCallback，确保创建进度
+                    setTimeout(createBatch, CONFIG.safari.particleCreateDelay);
                 } else {
                     // 粒子创建完成后再创建dust
                     createDustParticles();
@@ -669,7 +696,7 @@
         function createDustParticles() {
             const dustGeo = new THREE.OctahedronGeometry(0.1, 0);
             let created = 0;
-            const batchSize = isMobile ? 100 : 200;
+            const batchSize = isMobile ? 200 : 200; // 增大苹果端dust批次
             
             function createDustBatch() {
                 const end = Math.min(created + batchSize, CONFIG.particles.dustCount);
@@ -680,24 +707,29 @@
                 created = end;
                 
                 if (created < CONFIG.particles.dustCount) {
-                    requestIdleCallback(createDustBatch);
+                    setTimeout(createDustBatch, CONFIG.safari.particleCreateDelay); // 苹果端用setTimeout
                 } else {
-                    createStarTopper(); // 最后创建顶部星星
+                    STATE.particlesCreated = true;
+                    STATE.dustCreated = true;
+                    console.log("[调试] 粒子创建完成（苹果端适配）");
                 }
             }
             
             createDustBatch();
         }
 
-        function createStarTopper() {
+        // 独立抽离星星创建函数，优先执行
+        async function createStarTopper() {
             const star = new THREE.Mesh(new THREE.OctahedronGeometry(1.5, 0), matLib.starGold);
             star.position.set(0, CONFIG.particles.treeHeight/2 + 1.2, 0);
             const halo = new THREE.Mesh(new THREE.PlaneGeometry(8, 8), new THREE.MeshBasicMaterial({ 
                 map: new THREE.TextureLoader().load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/textures/sprites/glow.png'), 
-                blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, opacity: 0.5, color: 0xffaa00 
+                blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, opacity: isIOS ? 0.6 : 0.5, // 苹果端提升光晕透明度
+                color: 0xffaa00 
             }));
             star.add(halo); starGroup.add(star);
-            STATE.starMesh = star; STATE.starHaloMesh = halo; 
+            STATE.starMesh = star; STATE.starHaloMesh = halo;
+            console.log("[调试] 顶部星星已优先创建（苹果端适配）");
         }
 
         function addPhotoToScene(texture) {
@@ -800,7 +832,7 @@
             console.log("[调试] 环形展示已关闭");
         }
 
-        // 导入功能 - 导入成功后调用按钮替换函数
+        // 导入功能 - 导入成功后调用按钮替换函数（移除音频兼容）
         function importSceneData(jsonData) {
             try {
                 const data = JSON.parse(jsonData);
@@ -812,7 +844,11 @@
                     const audioEl = document.getElementById('bg-music');
                     audioEl.src = data.music;
                     audioEl.currentTime = 0;
-                    audioEl.play().catch(console.warn);
+                    // 移除苹果端音频兼容代码，恢复原始逻辑
+                    audioEl.play().catch(err => {
+                        console.warn("音频播放失败:", err);
+                        showGestureFeedback("音频播放失败", 3000);
+                    });
                 }
 
                 clearPhotos();
